@@ -1,38 +1,61 @@
 name: Docker Build
 
+# Builds every Dockerfile found in the repo (validation only, nothing is pushed).
+# The build context defaults to the Dockerfile's own directory; when a compose
+# file uses another one, declare it in .github/docker-contexts, one
+# "path/to/Dockerfile=context/dir" per line. Repos without any Dockerfile
+# (compose-only infra repos) pass without building anything.
 on:
   push:
     paths:
       - 'docker/**'
       - '**/Dockerfile*'
+      - '.github/workflows/docker-build.yml'
   pull_request:
     paths:
       - 'docker/**'
       - '**/Dockerfile*'
+      - '.github/workflows/docker-build.yml'
 
 jobs:
-  build:
+  discover:
     runs-on: ubuntu-latest
+    outputs:
+      dockerfiles: ${{ steps.find.outputs.dockerfiles }}
     steps:
       - uses: actions/checkout@v4
-      - name: Check for Dockerfile
-        id: dockerfile
+      - name: Find Dockerfiles
+        id: find
         run: |
-          if [ -f Dockerfile ] || find . -maxdepth 3 -iname 'Dockerfile*' -not -path './.git/*' | grep -q .; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-          fi
+          : > /tmp/entries
+          while IFS= read -r f; do
+            ctx=$(dirname "$f")
+            if [ -f .github/docker-contexts ]; then
+              override=$(grep -F "$f=" .github/docker-contexts | head -1 | cut -d= -f2- || true)
+              [ -n "$override" ] && ctx="$override"
+            fi
+            jq -nc --arg f "$f" --arg c "$ctx" '{dockerfile:$f,context:$c}' >> /tmp/entries
+          done < <(find . -iname 'Dockerfile*' -type f -not -path './.git/*' -not -path '*/node_modules/*' | sed 's|^\./||' | sort)
+          list=$(jq -sc . /tmp/entries)
+          echo "dockerfiles=${list}" >> "$GITHUB_OUTPUT"
+          echo "Dockerfiles found: ${list}"
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.dockerfiles != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile: ${{ fromJSON(needs.discover.outputs.dockerfiles) }}
+    steps:
+      - uses: actions/checkout@v4
       - name: Set up Docker Buildx
-        if: steps.dockerfile.outputs.found == 'true'
         uses: docker/setup-buildx-action@v3
       - name: Build image
-        if: steps.dockerfile.outputs.found == 'true'
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ${{ matrix.dockerfile.context }}
+          file: ${{ matrix.dockerfile.dockerfile }}
           push: false
-          tags: ${{ github.repository }}:${{ github.sha }}
-      - name: No Dockerfile yet
-        if: steps.dockerfile.outputs.found == 'false'
-        run: echo "No Dockerfile found — nothing to build yet. Add one under docker/ or at the repo root to enable this check."
+          tags: ci-check:${{ github.sha }}
